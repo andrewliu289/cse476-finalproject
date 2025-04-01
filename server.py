@@ -12,7 +12,7 @@ class PromptRequest(BaseModel):
 # Use Dev Data toggle
 # Set True when you want to use dev_data for few-shot prompting
 # Set False when you 
-useData = False
+useData = True
 # Batch size so you can see progress
 batchSize = 100
 
