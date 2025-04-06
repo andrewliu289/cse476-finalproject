@@ -1,115 +1,224 @@
-import requests
+import collections
+import json
+import math
 import re
+import statistics
+import time
+from typing import List
+import nltk
+import numpy as np
+import requests
+import tracemalloc
+from nltk.translate.bleu_score import sentence_bleu
+from nltk.translate.meteor_score import meteor_score
+from rouge_score import rouge_scorer
+from bert_score import score as bert_score
+from tqdm import tqdm
 
-url = "http://127.0.0.1:8000/chat"
 
-def query_model(prompt: str) -> str:
-    payload = {"prompt": prompt}
+URL = "http://localhost:8000"
+
+for i in ["punkt", "wordnet", "omw-1.4"]:
     try:
-        resp = requests.post(url, json=payload)
-        resp.raise_for_status()
-        return resp.json()["response"]
-    except Exception as e:
-        print("Error calling model")
-        return ""
-    
-def arithmetic():
-    prompts = [
-        ("What is 2 + 2?", "4"),
-        ("Calculate 17 minus 5.", "12"),
-        ("What is 7 multiplied by 6?", "42"),
-        ("What is 81 divided by 9?", "9"),
-        ("What is 3 plus 14?", "17"),
-    ]
+        nltk.data.find(f"tokenizers/{i}")
+    except LookupError:
+        nltk.download(i)
 
-    results = []
-    for prompt, expected in prompts:
-        answer = query_model(prompt).strip()
-        # Extract the first word/number
-        predicted = re.split(r"[\s,.;?!]+", answer)[0] if answer else ""
-        correct = (predicted == expected)
-        results.append((prompt, expected, predicted, correct))
-    return results
 
-def analogies():
-    prompts = [
-        ("King is to Queen as Man is to", "Woman"),
-        ("Paris is to France as Tokyo is to", "Japan"),
-        ("Dog is to Puppy as Cat is to", "Kitten"),
-        ("Bird is to Fly as Fish is to", "Swim"),
-    ]
+def getNum(text: str):
+    # Return the last number found in the text
+    if text is None:
+        return None
+    matches = re.findall(r"[-+]?\d*\.\d+|\d+", text)
+    return float(matches[-1]) if matches else None
 
-    results = []
-    for prompt, expected in prompts:
-        answer = query_model(prompt).strip()
-        # Extract the first word/number
-        predicted = re.split(r"[\s,.;?!]+", answer)[0] if answer else ""
-        correct = (predicted.lower() == expected.lower())
-        results.append((prompt, expected, predicted, correct))
-    return results
 
-def multiple_choice():
-    questions = [
-        {
-            "question": "King is to Queen as Man is to",
-            "choices": ["A) Woman", "B) Boy", "C) Prince", "D) Girl"],
-            "correct": "A) Woman"
-        },
-        {
-            "question": "Paris is to France as Tokyo is to",
-            "choices": ["A) Japan", "B) China", "C) Seoul", "D) Bangkok"],
-            "correct": "A) Japan"
-        }
-    ]
+def mathError(correct: float, pred: float | None, raw_pred: str | None):
+    if raw_pred is None or raw_pred.strip() == "":
+        return "no_answer"
+    if pred is None:
+        return "parse_error"
+    if correct is None:
+        return "correct_missing"
+    if abs(correct - pred) < 1e-3:
+        return "correct"
+    if re.search(r"[+\-*/^=]", raw_pred):
+        return "arithmetic"
+    return "logic"
 
-    results = []
-    for item in questions:
-        q = item["question"]
-        choices_str = "\n".join(item["choices"])
-        prompt = f"{q}:\n{choices_str}\nWhich one is correct?"
-        model_answer = query_model(prompt).strip()
+# Math evaluation
+def mathEval(path: str, url: str = URL):
+    data = json.load(open(path))
+    b = collections.Counter()
 
-        chosen = None
-        for c in item["choices"]:
-            label = c.split(")")[0] + ")"
-            text = c.split(")")[1].strip()
-            if label in model_answer or text in model_answer:
-                chosen = c
-                break
+    for sample in tqdm(data, desc="[math]"):
+        q = sample["question"]
+        correct = getNum(sample["answer"])
+        questions = [q]
 
-        correct = (chosen == item["correct"])
-        results.append((prompt, item["correct"], chosen, correct))
+        for q in questions:
+            r = requests.post(f"{url}/model", json={"prompt": q}).json()
+            resp = r.get("response", "")
+            pred = getNum(resp)
+            error = mathError(correct, pred, resp)
+            b[error] += 1
+            b["total"] += 1
+            if pred is not None:
+                b["answered"] += 1
 
-    return results
+    mathStats(b)
+    return b
 
-# Evals
+def mathStats(b: collections.Counter):
+    total = b["total"] or 1
+    print("\nMath Evaluation\n")
+    print(f"Accuracy: {b['correct'] / total:.2%}")
+    print(f"Answer Rate: {b['answered'] / total:.2%}")
+    for k in ("arithmetic", "logic", "parse_error", "no_answer"):
+        if b[k]:
+            print(f"{k}: {b[k] / total:.2%}")
+
+# Text generation evaluation
+def textEval(path: str, url: str = URL):
+    data = json.load(open(path))
+
+    bleu, rouge1, rouge2, rougel, meteorVals, bertVals = [], [], [], [], [], []
+    flags = collections.Counter()
+
+    rouge = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
+
+    refs: List[str] = []
+    hyps: List[str] = []
+
+    for sample in tqdm(data, desc="[text]"):
+        ref = sample["reference"]
+        inp = sample["input_text"]
+        hyp = requests.post(f"{url}/model", json={"prompt": inp}).json().get("response", "")
+
+        refs.append(ref)
+        hyps.append(hyp)
+
+        ref_tok = nltk.word_tokenize(ref.lower())
+        hyp_tok = nltk.word_tokenize(hyp.lower())
+
+        bleu.append(sentence_bleu([ref_tok], hyp_tok))
+        meteorVals.append(meteor_score([ref], hyp))
+        rs = rouge.score(ref, hyp)
+        rouge1.append(rs["rouge1"].recall)
+        rouge2.append(rs["rouge2"].recall)
+        rougel.append(rs["rougeL"].recall)
+
+        # Quick heuristics
+        if hallucination(hyp):
+            flags["hallucination"] += 1
+        if repetition(hyp):
+            flags["repetition"] += 1
+
+    _, _, f1 = bert_score(hyps, refs, lang="en", rescale_with_baseline=True)
+    bertVals = f1.tolist()
+
+    textStats(bleu, rouge1, rouge2, rougel, meteorVals, bertVals, flags, len(data))
+    return bleu, rouge1, rouge2, rougel, meteorVals, bertVals
+
+
+def textStats(bleu, r1, r2, rl, meteorVals, bertVals, flags, n):
+    def avg(x):
+        return sum(x) / len(x) if x else 0.0
+
+    print("\nText generation")
+    print(f"BLEU: {avg(bleu):.3f}")
+    print(f"ROUGE: R1 {avg(r1):.3f} | R2 {avg(r2):.3f} | RL {avg(rl):.3f}")
+    print(f"METEOR: {avg(meteorVals):.3f}")
+    print(f"BERT‑F1: {avg(bertVals):.3f}")
+    for k, v in flags.items():
+        print(f"{k.capitalize()}: {v / n:.2%}")
+    print()
+
+def hallucination(hyp: str) -> bool:
+    return bool(re.search(r"\d{4}", hyp))
+
+def repetition(hyp: str) -> bool:
+    toks = hyp.split()
+    return len(toks) != len(set(toks))
+
+# Loss/perplexity
+def lossPerplexityEval(path: str, url: str = URL):
+    texts = json.load(open(path))
+    losses, lengths = [], []
+
+    for t in tqdm(texts, desc="[loss]"):
+        resp = requests.post(f"{url}/compute_loss", json={"text": t}).json()
+        losses.append(resp["loss"])
+        lengths.append(resp["num_tokens"])
+
+    totalLoss = sum(lengths) or 1
+    total = 0
+    for loss, num in zip(losses, lengths):
+        total += loss * num
+
+    avgLoss = total / totalLoss
+    ppl = math.exp(avgLoss)
+
+    print("\nLoss/Perplexity Evaluation\n")
+    print(f"Total samples: {len(texts)}")
+    print(f"Total tokens: {totalLoss}")
+    print(f"Average loss: {avgLoss:.4f}")
+    print(f"Perplexity: {ppl:.2f}")
+
+    worst = np.argsort(losses)[-10:][::-1]
+    print("\nWorst 10 sentences by loss:")
+    for i in worst:
+        print(f"[{losses[i]:.2f}] {texts[i][:120]}…")
+
+    return avgLoss, ppl, losses
+
+# Efficiency measurement
+def measureEfficiency(prompt: str, url: str = URL, runs: int = 5):
+    latencies, peaks = [], []
+    for i in range(runs):
+        tracemalloc.start()
+        t0 = time.perf_counter()
+        i = requests.post(f"{url}/model", json={"prompt": prompt}).json()
+        latencies.append(time.perf_counter() - t0)
+        _, peak = tracemalloc.get_traced_memory()
+        peaks.append(peak / 1e6)
+        tracemalloc.stop()
+    print("\nEfficiency\n")
+    print(f"Mean Latency: {statistics.mean(latencies)*1000:.1f} ms")
+    print(f"Memory Peak: {statistics.mean(peaks):.1f} MB")
+    return latencies, peaks
+
 def main():
-    print("Arithmetic Evaluation:")
-    arithmetic_results = arithmetic()
-    correct_count = sum(r[3] for r in arithmetic_results)
-    print(f"Arithmetic Accuracy: {correct_count}/{len(arithmetic_results)} = {correct_count/len(arithmetic_results):.2%}")
-    for r in arithmetic_results:
-        prompt, expected, predicted, correct = r
-        print(f"Q: {prompt} | Expected: {expected} | Got: {predicted} | {'Correct' if correct else 'Wrong'}")
+    while True:
+        print("\nPick an Evaluation:")
+        print("1. Math")
+        print("2. Text")
+        print("3. Loss")
+        print("4. Efficiency")
+        print("5. All of the Above")
+        print("6. Exit")
 
-    print("Analogy Evaluation:")
-    analogy_results = analogies()
-    correct_count = sum(r[3] for r in analogy_results)
-    print(f"Analogy Accuracy: {correct_count}/{len(analogy_results)} = {correct_count/len(analogy_results):.2%}")
-    for r in analogy_results:
-        prompt, expected, predicted, correct = r
-        print(f"Q: {prompt} | Expected: {expected} | Got: {predicted} | {'Correct' if correct else 'Wrong'}")
+        choice = input("Enter 1–6: ").strip()
 
-    print("Multiple Choice Evaluation:")
-    mc_results = multiple_choice()
-    correct_count = sum(r[3] for r in mc_results)
-    print(f"Multiple-choice Accuracy: {correct_count}/{len(mc_results)} = {correct_count/len(mc_results):.2%}")
-    for r in mc_results:
-        prompt, expected, chosen, correct = r
-        print(f"Q: {prompt}")
-        print(f"A: {expected}")
-        print(f"Model: {chosen}")
-        print(f"{'Correct' if correct else 'Wrong'}")
+        if choice == "1":
+            mathEval("math.json")
+        elif choice == "2":
+            textEval("text.json")
+        elif choice == "3":
+            lossPerplexityEval("corpus.json")
+        elif choice == "4":
+            prompt = input("Enter prompt for efficiency test: ").strip()
+            measureEfficiency(prompt)
+        elif choice == "5":
+            mathEval("math.json")
+            textEval("text.json")
+            prompt = input("Enter prompt for efficiency test: ").strip()
+            lossPerplexityEval("corpus.json")
+            measureEfficiency(prompt)
+        elif choice == "6":
+            break
+        else:
+            print("Invalid choice")
 
 if __name__ == "__main__":
     main()

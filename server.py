@@ -1,57 +1,37 @@
 from fastapi import FastAPI
-from model import generator
+from model import generator, model, tokenizer
 from pydantic import BaseModel
-import json
-import random
+import torch
 
 app = FastAPI()
 
 class PromptRequest(BaseModel):
     prompt: str
 
-# Use Dev Data toggle
-# Set True when you want to use dev_data for few-shot prompting
-# Set False when you 
-useData = True
-# Batch size so you can see progress
-batchSize = 100
+class LossRequest(BaseModel):
+    text: str
 
-data = []
-if useData:
-    with open("dev_data.json", "r") as f:
-        rawData = json.load(f)
-        total = len(rawData)
-        print(f"Loading {total}")
+@app.post("/model")
+async def generate(request: PromptRequest):
+    prompt = request.prompt
 
-        for i in range(0, total, batchSize):
-            batch = rawData[i:i + batchSize]
-            data.extend(batch)
-            num = (i // batchSize) + 1
-            print(f"Batch {num} ({len(data)}/{total})")
-
-    print(f"Finished loading")
-
-def formatPrompt(input: str, num: int = 5) -> str:
-    if not useData or not data:
-        return input
-    
-    examples = random.sample(data, num)
-
-    formatted = ""
-    for i in examples:
-        formatted += f"<PROMPT>\n{i['question']}\n<RESPONSE>\n{i['answer']}\n\n"
-
-    formatted += f"<PROMPT>\n{input}\n<RESPONSE>\n"
-    return formatted
-
-@app.post("/chat")
-async def chat(request: PromptRequest):
-    prompt = formatPrompt(request.prompt)
+    # Generate text
     result = generator(prompt)[0]["generated_text"]
 
-    if useData:
-        response = result[len(prompt):].strip()
-    else:
-        response = result.strip()
-
+    response = result[len(prompt):].strip() if result.startswith(prompt) else result.strip()
     return {"response": response}
+
+@app.post("/compute_loss")
+async def compute_loss(req: LossRequest):
+    inputs = tokenizer(req.text, return_tensors="pt")
+    input_ids = inputs["input_ids"].to(model.device)
+
+    with torch.no_grad():
+        outputs = model(input_ids, labels=input_ids)
+        loss = outputs.loss
+
+    num_tokens = input_ids.size(1)
+    return {
+        "loss": float(loss.item()),
+        "num_tokens": int(num_tokens)
+    }

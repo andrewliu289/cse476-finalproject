@@ -1,5 +1,8 @@
 
 dev_data.json
+corpus.json
+math.json
+text.json
 
 __pycache__/
 *.py[cod]
