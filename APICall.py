@@ -174,19 +174,15 @@ def lossPerplexityEval(path: str, url: str = URL):
 
 # Efficiency measurement
 def measureEfficiency(prompt: str, url: str = URL, runs: int = 5):
-    latencies, peaks = [], []
+    latencies = []
     for i in range(runs):
-        tracemalloc.start()
         t0 = time.perf_counter()
-        i = requests.post(f"{url}/model", json={"prompt": prompt}).json()
+        _ = requests.post(f"{url}/model", json={"prompt": prompt}).json()
         latencies.append(time.perf_counter() - t0)
-        _, peak = tracemalloc.get_traced_memory()
-        peaks.append(peak / 1e6)
-        tracemalloc.stop()
+
     print("\nEfficiency\n")
     print(f"Mean Latency: {statistics.mean(latencies)*1000:.1f} ms")
-    print(f"Memory Peak: {statistics.mean(peaks):.1f} MB")
-    return latencies, peaks
+    return latencies
 
 def main():
     while True:
@@ -210,9 +206,9 @@ def main():
             prompt = input("Enter prompt for efficiency test: ").strip()
             measureEfficiency(prompt)
         elif choice == "5":
+            prompt = input("Enter prompt for efficiency test: ").strip()
             mathEval("math.json")
             textEval("text.json")
-            prompt = input("Enter prompt for efficiency test: ").strip()
             lossPerplexityEval("corpus.json")
             measureEfficiency(prompt)
         elif choice == "6":
