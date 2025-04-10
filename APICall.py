@@ -47,18 +47,21 @@ def mathError(correct: float, pred: float | None, raw_pred: str | None):
     return "logic"
 
 # Math evaluation
-def mathEval(path: str, url: str = URL):
+def mathEval(path: str, url: str = URL, batch_size: int = 8):
     data = json.load(open(path))
     b = collections.Counter()
 
-    for sample in tqdm(data, desc="[math]"):
-        q = sample["question"]
-        correct = getNum(sample["answer"])
-        questions = [q]
+    prompts = [sample["question"] for sample in data]
+    answers = [getNum(sample["answer"]) for sample in data]
 
-        for q in questions:
-            r = requests.post(f"{url}/model", json={"prompt": q}).json()
-            resp = r.get("response", "")
+    for i in tqdm(range(0, len(prompts), batch_size), desc="[math]"):
+        batch_prompts = prompts[i:i+batch_size]
+        batch_answers = answers[i:i+batch_size]
+
+        r = requests.post(f"{url}/model", json={"prompts": batch_prompts}).json()
+        batch_responses = r.get("responses", [])
+
+        for resp, correct in zip(batch_responses, batch_answers):
             pred = getNum(resp)
             error = mathError(correct, pred, resp)
             b[error] += 1
@@ -68,6 +71,7 @@ def mathEval(path: str, url: str = URL):
 
     mathStats(b)
     return b
+
 
 def mathStats(b: collections.Counter):
     total = b["total"] or 1
@@ -79,46 +83,51 @@ def mathStats(b: collections.Counter):
             print(f"{k}: {b[k] / total:.2%}")
 
 # Text generation evaluation
-def textEval(path: str, url: str = URL):
-    data = json.load(open(path))
+def textEval(path: str, url: str = URL, batch_size: int = 8):
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
 
     bleu, rouge1, rouge2, rougel, meteorVals, bertVals = [], [], [], [], [], []
     flags = collections.Counter()
 
     rouge = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
 
-    refs: List[str] = []
+    refs: List[str] = [sample["reference"] for sample in data]
+    inputs: List[str] = [sample["input_text"] for sample in data]
     hyps: List[str] = []
 
-    for sample in tqdm(data, desc="[text]"):
-        ref = sample["reference"]
-        inp = sample["input_text"]
-        hyp = requests.post(f"{url}/model", json={"prompt": inp}).json().get("response", "")
+    for i in tqdm(range(0, len(inputs), batch_size), desc="[text]"):
+        batch_inputs = inputs[i:i+batch_size]
+        batch_refs = refs[i:i+batch_size]
 
-        refs.append(ref)
-        hyps.append(hyp)
+        r = requests.post(f"{url}/model", json={"prompts": batch_inputs}).json()
+        batch_outputs = r.get("responses", [])
 
-        ref_tok = nltk.word_tokenize(ref.lower())
-        hyp_tok = nltk.word_tokenize(hyp.lower())
+        for hyp, ref in zip(batch_outputs, batch_refs):
+            hyps.append(hyp)
 
-        bleu.append(sentence_bleu([ref_tok], hyp_tok))
-        meteorVals.append(meteor_score([ref], hyp))
-        rs = rouge.score(ref, hyp)
-        rouge1.append(rs["rouge1"].recall)
-        rouge2.append(rs["rouge2"].recall)
-        rougel.append(rs["rougeL"].recall)
+            ref_tok = nltk.word_tokenize(ref.lower())
+            hyp_tok = nltk.word_tokenize(hyp.lower())
 
-        # Quick heuristics
-        if hallucination(hyp):
-            flags["hallucination"] += 1
-        if repetition(hyp):
-            flags["repetition"] += 1
+            bleu.append(sentence_bleu([ref_tok], hyp_tok))
+            meteorVals.append(meteor_score([ref_tok], hyp_tok))
+
+            rs = rouge.score(ref, hyp)
+            rouge1.append(rs["rouge1"].recall)
+            rouge2.append(rs["rouge2"].recall)
+            rougel.append(rs["rougeL"].recall)
+
+            if hallucination(hyp):
+                flags["hallucination"] += 1
+            if repetition(hyp):
+                flags["repetition"] += 1
 
     _, _, f1 = bert_score(hyps, refs, lang="en", rescale_with_baseline=True)
     bertVals = f1.tolist()
 
     textStats(bleu, rouge1, rouge2, rougel, meteorVals, bertVals, flags, len(data))
     return bleu, rouge1, rouge2, rougel, meteorVals, bertVals
+
 
 
 def textStats(bleu, r1, r2, rl, meteorVals, bertVals, flags, n):
@@ -142,14 +151,18 @@ def repetition(hyp: str) -> bool:
     return len(toks) != len(set(toks))
 
 # Loss/perplexity
-def lossPerplexityEval(path: str, url: str = URL):
-    texts = json.load(open(path))
+def lossPerplexityEval(path: str, url: str = URL, batch_size: int = 8):
+    with open(path, encoding="utf-8") as f:
+        texts = json.load(f)
+
     losses, lengths = [], []
 
-    for t in tqdm(texts, desc="[loss]"):
-        resp = requests.post(f"{url}/compute_loss", json={"text": t}).json()
-        losses.append(resp["loss"])
-        lengths.append(resp["num_tokens"])
+    for i in tqdm(range(0, len(texts), batch_size), desc="[loss]"):
+        batch_texts = texts[i:i+batch_size]
+        r = requests.post(f"{url}/compute_loss", json={"texts": batch_texts}).json()
+
+        losses.extend(r["losses"])
+        lengths.extend(r["num_tokens"])
 
     totalLoss = sum(lengths) or 1
     total = 0
@@ -172,17 +185,24 @@ def lossPerplexityEval(path: str, url: str = URL):
 
     return avgLoss, ppl, losses
 
+
 # Efficiency measurement
 def measureEfficiency(prompt: str, url: str = URL, runs: int = 5):
     latencies = []
     for i in range(runs):
         t0 = time.perf_counter()
-        _ = requests.post(f"{url}/model", json={"prompt": prompt}).json()
+        r = requests.post(f"{url}/model", json={"prompts": [prompt]})
+        r.raise_for_status()
+
+        response = r.json()
+        _ = response["responses"][0]
         latencies.append(time.perf_counter() - t0)
 
     print("\nEfficiency\n")
     print(f"Mean Latency: {statistics.mean(latencies)*1000:.1f} ms")
     return latencies
+
+
 
 def main():
     while True:

@@ -1,37 +1,47 @@
 from fastapi import FastAPI
 from model import generator, model, tokenizer
 from pydantic import BaseModel
+from typing import List
 import torch
 
 app = FastAPI()
 
 class PromptRequest(BaseModel):
-    prompt: str
+    prompts: List[str]
 
 class LossRequest(BaseModel):
-    text: str
+    texts: List[str]
 
 @app.post("/model")
-async def generate(request: PromptRequest):
-    prompt = request.prompt
+async def generate_batch(request: PromptRequest):
+    prompts = request.prompts
 
-    # Generate text
-    result = generator(prompt)[0]["generated_text"]
+    results = generator(prompts)
 
-    response = result[len(prompt):].strip() if result.startswith(prompt) else result.strip()
-    return {"response": response}
+    responses = []
+    for prompt, result in zip(prompts, results):
+        full = result[0]["generated_text"]
+        trimmed = full[len(prompt):].strip() if full.startswith(prompt) else full.strip()
+        responses.append(trimmed)
+
+    return {"responses": responses}
+
 
 @app.post("/compute_loss")
 async def compute_loss(req: LossRequest):
-    inputs = tokenizer(req.text, return_tensors="pt")
-    input_ids = inputs["input_ids"].to(model.device)
+    losses = []
+    num_tokens = []
 
-    with torch.no_grad():
-        outputs = model(input_ids, labels=input_ids)
-        loss = outputs.loss
+    for text in req.texts:
+        inputs = tokenizer(text, return_tensors="pt")
+        input_ids = inputs["input_ids"].to(model.device)
 
-    num_tokens = input_ids.size(1)
+        with torch.no_grad():
+            outputs = model(input_ids, labels=input_ids)
+            losses.append(float(outputs.loss.item()))
+            num_tokens.append(int(input_ids.size(1)))
+
     return {
-        "loss": float(loss.item()),
-        "num_tokens": int(num_tokens)
+        "losses": losses,
+        "num_tokens": num_tokens
     }
